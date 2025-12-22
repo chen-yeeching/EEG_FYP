@@ -7,6 +7,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 from sklearn.preprocessing import StandardScaler
 from scipy.signal import medfilt
+from scipy.interpolate import griddata
 import warnings
 import os
 import time
@@ -72,6 +73,20 @@ EMOTION_COLORS = {
 
 TARGET_SENSORS = ['F3', 'Fp1', 'AF3', 'FC5', 'F4', 'Fp2', 'AF4', 'FC6', 
                   'F8', 'T7', 'T8', 'O1', 'O2', 'Oz', 'Cz', 'Fz', 'C4', 'Pz']
+
+# Standard 10-20 system electrode positions (simplified 2D projection)
+ELECTRODE_POSITIONS = {
+    'Fp1': (-0.3, 0.8), 'Fp2': (0.3, 0.8),
+    'F7': (-0.6, 0.5), 'F3': (-0.3, 0.5), 'Fz': (0, 0.5), 'F4': (0.3, 0.5), 'F8': (0.6, 0.5),
+    'T7': (-0.7, 0), 'C3': (-0.3, 0), 'Cz': (0, 0), 'C4': (0.3, 0), 'T8': (0.7, 0),
+    'P7': (-0.6, -0.5), 'P3': (-0.3, -0.5), 'Pz': (0, -0.5), 'P4': (0.3, -0.5), 'P8': (0.6, -0.5),
+    'O1': (-0.3, -0.8), 'Oz': (0, -0.8), 'O2': (0.3, -0.8),
+    'AF3': (-0.2, 0.65), 'AF4': (0.2, 0.65),
+    'FC5': (-0.5, 0.25), 'FC1': (-0.15, 0.25), 'FC2': (0.15, 0.25), 'FC6': (0.5, 0.25),
+    'CP5': (-0.5, -0.25), 'CP1': (-0.15, -0.25), 'CP2': (0.15, -0.25), 'CP6': (0.5, -0.25),
+    'FT9': (-0.75, 0.15), 'FT10': (0.75, 0.15),
+    'PO9': (-0.5, -0.7), 'PO10': (0.5, -0.7)
+}
 
 ROLLING_WINDOW_SIZE = 128
 CONTEXT_WINDOW = 5  # For SVM context stacking
@@ -222,6 +237,229 @@ def preprocess_for_cnn(df):
     
     return np.array(segments)
 
+def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_zscore=True, color_scale='plasma'):
+    """Create a futuristic brain heatmap visualization with smooth interpolation.
+    
+    Features:
+    - Dark theme with transparent background
+    - Smooth interpolation for continuous heatmap
+    - Futuristic colormap (plasma)
+    - Contour lines for depth
+    - Horizontal colorbar at bottom
+    """
+    fig = go.Figure()
+    
+    # Create electrode positions and values
+    x_pos = []
+    y_pos = []
+    raw_values = []
+    labels = []
+    
+    for electrode, (x, y) in ELECTRODE_POSITIONS.items():
+        if electrode in electrode_values:
+            x_pos.append(x)
+            y_pos.append(y)
+            raw_val = float(electrode_values[electrode])
+            raw_values.append(raw_val)
+            labels.append(f"{electrode}<br>Raw: {raw_val:.2f}")
+    
+    if not raw_values:
+        return None
+    
+    values = np.array(raw_values, dtype=float)
+    
+    # Convert to z-scores for better visualization
+    if use_zscore and len(values) > 1:
+        mean_val = float(np.mean(values))
+        std_val = float(np.std(values)) or 1e-6
+        z_values = (values - mean_val) / std_val
+        values_for_color = z_values
+        max_abs = float(np.max(np.abs(z_values)))
+        cmin, cmax = -max_abs, max_abs
+        colorbar_title = "Z-score"
+    else:
+        values_for_color = values
+        cmin, cmax = float(np.min(values)), float(np.max(values))
+        colorbar_title = "Activity Level"
+    
+    # Create a fine grid for smooth interpolation
+    grid_resolution = 100
+    x_grid = np.linspace(-1.1, 1.1, grid_resolution)
+    y_grid = np.linspace(-1.1, 1.1, grid_resolution)
+    X_grid, Y_grid = np.meshgrid(x_grid, y_grid)
+    
+    # Interpolate values onto the grid
+    points = np.column_stack((x_pos, y_pos))
+    Z_grid = griddata(points, values_for_color, (X_grid, Y_grid), method='cubic', fill_value=np.nan)
+    
+    # Create a mask for the head shape (circle)
+    head_mask = X_grid**2 + Y_grid**2 <= 1.0
+    Z_grid[~head_mask] = np.nan
+    
+    # Add smooth heatmap surface
+    fig.add_trace(go.Contour(
+        x=x_grid,
+        y=y_grid,
+        z=Z_grid,
+        colorscale=color_scale,
+        showscale=True,
+        colorbar=dict(
+            title=dict(text=colorbar_title, font=dict(color='white', size=12)),
+            tickfont=dict(color='white', size=10),
+            len=0.4,
+            thickness=15,
+            x=0.5,
+            y=-0.15,
+            xanchor='center',
+            yanchor='middle',
+            orientation='h',
+            tickmode='linear',
+            tick0=cmin,
+            dtick=(cmax - cmin) / 5,
+            tickformat='.2f'
+        ),
+        contours=dict(
+            showlines=True,
+            start=cmin,
+            end=cmax,
+            size=(cmax - cmin) / 8,
+            coloring='heatmap'
+        ),
+        line=dict(width=0.5, color='rgba(255,255,255,0.3)'),
+        hovertemplate='Z-score: %{z:.2f}<extra></extra>',
+        name='Activity'
+    ))
+    
+    # Add electrode markers with labels
+    key_electrodes = ['Fp1', 'Fp2', 'F3', 'F4', 'Fz', 'C3', 'C4', 'Cz', 'P3', 'P4', 'Pz', 'O1', 'O2', 'Oz']
+    
+    fig.add_trace(go.Scatter(
+        x=x_pos,
+        y=y_pos,
+        mode='markers',
+        marker=dict(
+            size=12,
+            color=values_for_color,
+            colorscale=color_scale,
+            cmin=cmin,
+            cmax=cmax,
+            line=dict(width=2, color='white'),
+            showscale=False
+        ),
+        text=[label.split('<br>')[0] for label in labels],
+        textposition="middle center",
+        textfont=dict(size=9, color='white', family='Arial Black'),
+        hovertemplate='%{text}<br>Z-score: %{marker.color:.2f}<extra></extra>',
+        name='Electrodes',
+        showlegend=False
+    ))
+    
+    # Draw head outline (circle) - white for dark theme
+    theta = np.linspace(0, 2*np.pi, 100)
+    head_x = np.cos(theta)
+    head_y = np.sin(theta)
+    
+    fig.add_trace(go.Scatter(
+        x=head_x,
+        y=head_y,
+        mode='lines',
+        line=dict(color='rgba(255,255,255,0.8)', width=3),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+    
+    # Add nose - white for dark theme
+    nose_x = [0, 0.1, 0, -0.1, 0]
+    nose_y = [1, 0.95, 0.9, 0.95, 1]
+    fig.add_trace(go.Scatter(
+        x=nose_x,
+        y=nose_y,
+        mode='lines',
+        line=dict(color='rgba(255,255,255,0.8)', width=3),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+    
+    # Enhanced title styling
+    title_text = f"<b style='font-size:20px; color:#00ffff;'>{title}</b><br>" \
+                 f"<span style='font-size:12px; color:#cccccc;'>Red indicates high-amplitude regions, Blue indicates low-amplitude regions</span>"
+    
+    fig.update_layout(
+        title=dict(
+            text=title_text,
+            x=0.5,
+            xanchor='center',
+            font=dict(color='white')
+        ),
+        xaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False,
+            range=[-1.2, 1.2]
+        ),
+        yaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            showticklabels=False,
+            range=[-1.2, 1.2],
+            scaleanchor="x",
+            scaleratio=1
+        ),
+        height=650,
+        width=650,
+        showlegend=False,
+        plot_bgcolor='rgba(0,0,0,0)',  # Transparent background
+        paper_bgcolor='rgba(0,0,0,0)',  # Transparent paper
+        margin=dict(l=20, r=20, t=80, b=80)
+    )
+    
+    return fig
+
+def extract_electrode_data(df, frequency_band='Alpha', metric='mean'):
+    """Extract electrode values for a specific frequency band.
+    Extracts all available electrodes that have positions defined.
+
+    metric: 'mean', 'max', or 'min'
+    """
+    electrode_values = {}
+    metric = metric.lower()
+    
+    # Find all available electrodes from the data
+    pow_cols = [c for c in df.columns if str(c).strip().startswith("POW.")]
+    
+    # Extract electrode names from column names
+    available_electrodes = set()
+    for col in pow_cols:
+        parts = str(col).split('.')
+        if len(parts) >= 3 and frequency_band in parts[-1]:
+            # Extract electrode name (e.g., "POW.Fp1.Alpha" -> "Fp1")
+            electrode = parts[1]
+            if electrode in ELECTRODE_POSITIONS:
+                available_electrodes.add(electrode)
+    
+    # Extract values for all available electrodes
+    for sensor in available_electrodes:
+        col_name = f"POW.{sensor}.{frequency_band}"
+        series = None
+        if col_name in df.columns:
+            series = df[col_name]
+        else:
+            # Try alternative column names
+            for col in pow_cols:
+                if sensor in str(col) and frequency_band in str(col):
+                    series = df[col]
+                    break
+        if series is not None:
+            if metric == 'max':
+                value = float(series.max())
+            elif metric == 'min':
+                value = float(series.min())
+            else:
+                value = float(series.mean())
+            electrode_values[sensor] = value
+    
+    return electrode_values
+
 # ============================================
 # PAGE 1: Scientific Defense Dashboard
 # ============================================
@@ -327,7 +565,7 @@ def page_scientific_defense():
     st.dataframe(model_specs, use_container_width=True, hide_index=True)
 
 # ============================================
-# PAGE 2: Live Patient Monitor (Creative)
+# PAGE 2: Live Monitor (Creative)
 # ============================================
 def page_live_monitor():
     st.title("🫀 Live EEG Emotion Monitor")
@@ -338,7 +576,7 @@ def page_live_monitor():
         st.error("SVM model not found. Please ensure 'models/eeg_emotion_svm_model.pkl' exists.")
         return
     
-    uploaded_file = st.file_uploader("Upload Patient Session (.csv)", type=["csv"], key="live")
+    uploaded_file = st.file_uploader("Upload EEG CSV file", type=["csv"], key="live")
     
     if uploaded_file is not None:
         try:
@@ -457,7 +695,7 @@ def page_live_monitor():
             if len(X_stacked) == 0:
                 st.error("Not enough data for context window stacking.")
                 return
-            
+                
             # Scale and predict
             if svm_scaler is not None:
                 X_scaled = svm_scaler.transform(X_stacked)
@@ -525,7 +763,7 @@ def page_live_monitor():
                         emoji = color_map.get(emotion_name, "⚪")
                         
                         status_placeholder.markdown(f"""
-                        ### Patient Status:
+                        ### Status:
                         # {emoji} {emotion_name}
                         
                         **Confidence:** High  
@@ -538,11 +776,11 @@ def page_live_monitor():
                 
                 progress_bar.empty()
                 st.success("✅ Simulation complete!")
-        
+                
         except Exception as e:
             st.error(f"Error processing file: {e}")
             st.exception(e)
-
+        
 # ============================================
 # PAGE 3: Comparative Analysis (SVM vs CNN)
 # ============================================
@@ -698,9 +936,71 @@ def page_head_to_head():
                         <p><strong>CNN:</strong> {cnn_emotion} ({cnn_confidence:.1f}%)</p>
                     </div>
                     """, unsafe_allow_html=True)
-                else:
+            else:
                     st.info("Please wait for both models to complete predictions.")
             
+        except Exception as e:
+            st.error(f"Error processing file: {e}")
+            st.exception(e)
+
+# ============================================
+# PAGE 4: Brain Heatmap
+# ============================================
+def page_brain_heatmap():
+    st.header("🧠 Brain Activity Heatmap")
+    
+    # Data source selection
+    uploaded_file = st.file_uploader("Upload EEG CSV file", type=['csv'], key="heatmap")
+    
+    if uploaded_file is not None:
+        try:
+            # Smart header detection
+            import csv
+            import io
+            
+            content = uploaded_file.read()
+            uploaded_file.seek(0)
+            
+            header_row_index = None
+            reader = csv.reader(io.StringIO(content.decode('utf-8', errors='replace')))
+            for i, row in enumerate(reader):
+                row_str = ",".join(row)
+                if "POW." in row_str and "Timestamp" in row_str:
+                    header_row_index = i
+                    break
+            
+            if header_row_index is not None:
+                df = pd.read_csv(uploaded_file, header=header_row_index, low_memory=False)
+            else:
+                uploaded_file.seek(0)
+                df = pd.read_csv(uploaded_file, header=1, low_memory=False)
+                if not any(str(c).startswith("POW.") for c in df.columns):
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, header=0, low_memory=False)
+            
+            # Use default settings: Alpha band, mean metric, all data
+            frequency_band = "Alpha"
+            metric = "mean"
+            df_window = df
+            
+            # Extract electrode data
+            electrode_values = extract_electrode_data(df_window, frequency_band, metric=metric)
+            
+            if electrode_values:
+                # Create heatmap
+                futuristic_title = "Live Neural Topography"
+                
+                fig = create_brain_heatmap(
+                    electrode_values, 
+                    title=futuristic_title,
+                    use_zscore=True,
+                    color_scale='RdBu_r'
+                )
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Could not extract electrode data. Please check data format.")
+        
         except Exception as e:
             st.error(f"Error processing file: {e}")
             st.exception(e)
@@ -712,10 +1012,11 @@ def main():
     st.markdown('<div class="main-header">🧠 EEG Emotion Detection - Central Command Center</div>', unsafe_allow_html=True)
     
     # Top Navigation Bar with Tabs
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "📊 Scientific Defense",
-        "🫀 Live Patient Monitor",
-        "⚖️ Comparative Analysis"
+        "🫀 Live Monitor",
+        "⚖️ Comparative Analysis",
+        "🧠 Brain Heatmap"
     ])
     
     # Route to appropriate page based on selected tab
@@ -727,6 +1028,9 @@ def main():
     
     with tab3:
         page_head_to_head()
+    
+    with tab4:
+        page_brain_heatmap()
 
 if __name__ == "__main__":
     main()
