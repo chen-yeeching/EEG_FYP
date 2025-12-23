@@ -461,31 +461,36 @@ def extract_electrode_data(df, frequency_band='Alpha', metric='mean'):
     return electrode_values
 
 # ============================================
-# PAGE 1: Scientific Defense Dashboard
+# PAGE 1: Data Overview
 # ============================================
 def page_scientific_defense():
-    st.header("📊 Scientific Defense Dashboard")
-    st.markdown("**Prove to your supervisor that your data and splits are valid.**")
+    """Dataset overview dashboard."""
+    st.header("📊 Data Overview")
+    st.markdown("**High-level summary of your EEG emotion dataset.**")
     
+    # Top-level dataset stats (like the sample dashboard)
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Total Files", DATASET_INFO['total_files'])
+        st.metric("Total Sessions", DATASET_INFO['total_files'])
     with col2:
-        st.metric("Training Files", DATASET_INFO['train_files'])
+        st.metric("Training Sessions", DATASET_INFO['train_files'])
     with col3:
-        st.metric("Test Files", DATASET_INFO['test_files'])
+        total = DATASET_INFO['total_files']
+        test = DATASET_INFO['test_files']
+        test_pct = (test / total) * 100 if total else 0
+        st.metric("Test Split", f"{test} ({test_pct:.1f}%)")
     
     st.divider()
     
-    # Class Distribution
-    st.subheader("Class Distribution")
+    # Class distribution summary
+    st.subheader("Emotion Class Distribution")
     col1, col2 = st.columns(2)
     
     with col1:
         fig_pie = px.pie(
             values=list(DATASET_INFO['class_distribution'].values()),
             names=list(DATASET_INFO['class_distribution'].keys()),
-            title="Emotion Class Distribution",
+            title="Label Balance",
             color_discrete_map=EMOTION_COLORS
         )
         st.plotly_chart(fig_pie, use_container_width=True)
@@ -493,76 +498,41 @@ def page_scientific_defense():
     with col2:
         st.subheader("Distribution Details")
         for emotion, count in DATASET_INFO['class_distribution'].items():
-            percentage = (count / DATASET_INFO['total_files']) * 100
-            st.write(f"**{emotion}**: {count} files ({percentage:.1f}%)")
+            percentage = (count / DATASET_INFO['total_files']) * 100 if DATASET_INFO['total_files'] else 0
+            st.write(f"**{emotion}**: {count} samples ({percentage:.1f}%)")
     
     st.divider()
     
-    # Evidence: Raw Data Viewer
-    st.subheader("📋 Evidence: Raw Data Viewer")
-    st.write("First 5 rows showing POW (Power Spectral) columns to prove real Band Power data:")
-    
-    uploaded_file = st.file_uploader("Upload EEG CSV to view raw data", type=['csv'], key="defense")
-    if uploaded_file:
-        try:
-            # Smart header detection
-            import csv
-            import io
-            
-            content = uploaded_file.read()
-            uploaded_file.seek(0)
-            
-            header_row_index = None
-            reader = csv.reader(io.StringIO(content.decode('utf-8', errors='replace')))
-            for i, row in enumerate(reader):
-                row_str = ",".join(row)
-                if "POW." in row_str and "Timestamp" in row_str:
-                    header_row_index = i
-                    break
-            
-            if header_row_index is not None:
-                df = pd.read_csv(uploaded_file, header=header_row_index, low_memory=False)
-            else:
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, header=1, low_memory=False)
-                if not any(str(c).startswith("POW.") for c in df.columns):
-                    uploaded_file.seek(0)
-                    df = pd.read_csv(uploaded_file, header=0, low_memory=False)
-            pow_cols = [c for c in df.columns if str(c).strip().startswith("POW.")]
-            if pow_cols:
-                st.dataframe(df[pow_cols].head(), use_container_width=True)
-                st.success(f"✅ Found {len(pow_cols)} Power Spectral columns")
-            else:
-                st.warning("No POW columns found in this file.")
-        except Exception as e:
-            st.error(f"Error loading file: {e}")
-    
-    st.divider()
-    
-    # Model Specs Comparison
-    st.subheader("🤖 Model Specifications Comparison")
-    
-    model_specs = pd.DataFrame({
-        'Model': ['SVM (You)', 'CNN (Friend)'],
-        'Approach': [
-            'Feature Engineered (Context Stacking)',
-            'Feature Learning (Raw Input)'
-        ],
-        'Input Type': [
-            'Engineered Features + Ratios',
-            'Raw Time Series Segments'
-        ],
-        'Sequential Handling': [
-            'Context Window Stacking (5 frames)',
-            'Convolutional Layers (Temporal)'
-        ],
-        'Advantages': [
-            'Interpretable features, Domain knowledge',
-            'Automatic feature extraction, End-to-end learning'
-        ]
-    })
-    
-    st.dataframe(model_specs, use_container_width=True, hide_index=True)
+    # Feature descriptions table (similar to sample screenshot)
+    st.subheader("📚 Feature Descriptions")
+    feature_rows = [
+        {
+            "Feature": "Timestamp",
+            "Description": "Sampling time index for each EEG frame."
+        },
+        {
+            "Feature": "Raw EEG Channels",
+            "Description": "Voltage readings from sensors (Cz, Fz, Fp1, Fp2, F3, F4, etc.)."
+        },
+        {
+            "Feature": "Power Spectral Features (POW.*)",
+            "Description": "Band power per electrode for Theta, Alpha, Beta, Gamma ranges."
+        },
+        {
+            "Feature": "Context Windows",
+            "Description": "Stacked frames (window size 5) to capture temporal context for SVM."
+        },
+        {
+            "Feature": "Emotion Label",
+            "Description": "Ground-truth class for each session (Happy, Neutral, Sad, Anxiety)."
+        },
+        {
+            "Feature": "Metadata",
+            "Description": "Any additional markers or quality indices included in the CSV."
+        },
+    ]
+    features_df = pd.DataFrame(feature_rows)
+    st.dataframe(features_df, use_container_width=True, hide_index=True)
 
 # ============================================
 # PAGE 2: Live Monitor (Creative)
@@ -570,8 +540,11 @@ def page_scientific_defense():
 def page_live_monitor():
     st.title("🫀 Live EEG Emotion Monitor")
     st.markdown("**Simulates a real-time data stream to demonstrate sequential analysis.**")
+    st.markdown("_This view runs **both** SVM (context window classifier) and CNN on the uploaded file._")
     
+    # Load models
     svm_model, svm_scaler, svm_artifact = load_svm_model()
+    cnn_model, cnn_artifact = load_cnn_model()
     if svm_model is None:
         st.error("SVM model not found. Please ensure 'models/eeg_emotion_svm_model.pkl' exists.")
         return
@@ -676,7 +649,7 @@ def page_live_monitor():
                 st.error("Visualization columns contain no valid numeric data.")
                 return
             
-            # Prepare data for model - match training pipeline exactly
+            # Prepare data for SVM model - match training pipeline exactly
             # Training uses raw POW columns directly, not preprocessed features
             pow_cols = [c for c in df.columns if str(c).strip().startswith("POW.")]
             if not pow_cols:
@@ -707,6 +680,28 @@ def page_live_monitor():
             
             y_pred_raw = svm_model.predict(X_scaled)
             y_pred_smooth = medfilt(y_pred_raw, kernel_size=5)
+            
+            # Prepare CNN summary (overall prediction for this file)
+            cnn_summary_title = "🧠 CNN View"
+            if cnn_model is None:
+                cnn_summary_text = "CNN model not available. Please ensure the CNN model file exists, then use the **Comparative Analysis** tab (SVM vs CNN)."
+            else:
+                cnn_data = preprocess_for_cnn(df)
+                if cnn_data is not None:
+                    try:
+                        cnn_predictions = np.argmax(cnn_model.predict(cnn_data, verbose=0), axis=1)
+                        cnn_smooth = medfilt(cnn_predictions, kernel_size=3)
+                        
+                        unique_cnn, counts_cnn = np.unique(cnn_smooth, return_counts=True)
+                        most_common_idx_cnn = unique_cnn[np.argmax(counts_cnn)]
+                        cnn_emotion = EMOTION_LABELS[most_common_idx_cnn]
+                        cnn_confidence = (counts_cnn[np.argmax(counts_cnn)] / len(cnn_smooth)) * 100
+                        
+                        cnn_summary_text = f"**CNN Predicted Emotion:** {cnn_emotion} ({cnn_confidence:.1f}% confidence)"
+                    except Exception:
+                        cnn_summary_text = "CNN model encountered an error while processing this file. Please check the **Comparative Analysis** tab for more details."
+                else:
+                    cnn_summary_text = "Could not preprocess data for CNN on this file. Please verify the input format or use the **Comparative Analysis** tab."
             
             # Ensure vis_data and predictions are aligned
             if len(vis_data) == 0:
@@ -776,6 +771,8 @@ def page_live_monitor():
                 
                 progress_bar.empty()
                 st.success("✅ Simulation complete!")
+                st.subheader(cnn_summary_title)
+                st.markdown(cnn_summary_text)
                 
         except Exception as e:
             st.error(f"Error processing file: {e}")
@@ -1011,12 +1008,12 @@ def page_brain_heatmap():
 def main():
     st.markdown('<div class="main-header">🧠 EEG Emotion Detection - Central Command Center</div>', unsafe_allow_html=True)
     
-    # Top Navigation Bar with Tabs
+    # Top Navigation Bar with Tabs (custom order)
     tab1, tab2, tab3, tab4 = st.tabs([
-        "📊 Scientific Defense",
+        "📊 Data Overview",
+        "🧠 Brain Heatmap",
         "🫀 Live Monitor",
         "⚖️ Comparative Analysis",
-        "🧠 Brain Heatmap"
     ])
     
     # Route to appropriate page based on selected tab
@@ -1024,13 +1021,13 @@ def main():
         page_scientific_defense()
     
     with tab2:
-        page_live_monitor()
+        page_brain_heatmap()
     
     with tab3:
-        page_head_to_head()
+        page_live_monitor()
     
     with tab4:
-        page_brain_heatmap()
+        page_head_to_head()
 
 if __name__ == "__main__":
     main()
