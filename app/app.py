@@ -71,25 +71,35 @@ EMOTION_COLORS = {
     'Anxiety': '#FF4500'
 }
 
-TARGET_SENSORS = ['F3', 'Fp1', 'AF3', 'FC5', 'F4', 'Fp2', 'AF4', 'FC6', 
-                  'F8', 'T7', 'T8', 'O1', 'O2', 'Oz', 'Cz', 'Fz', 'C4', 'Pz']
+TARGET_SENSORS = [
+    'Cz', 'Fz', 'Fp1', 'F7', 'F3', 'FC1', 'C3', 'FC5',
+    'FT9', 'T7', 'CP5', 'CP1', 'P3', 'P7', 'PO9', 'O1',
+    'Pz', 'Oz', 'O2', 'PO10', 'P8', 'P4', 'CP2', 'CP6',
+    'T8', 'FT10', 'FC6', 'C4', 'FC2', 'F4', 'F8', 'Fp2'
+]
 
-# Standard 10-20 system electrode positions (simplified 2D projection)
+# Standard 10–20 system electrode positions (2D projection) matching the 32 TARGET_SENSORS
 ELECTRODE_POSITIONS = {
     'Fp1': (-0.3, 0.8), 'Fp2': (0.3, 0.8),
-    'F7': (-0.6, 0.5), 'F3': (-0.3, 0.5), 'Fz': (0, 0.5), 'F4': (0.3, 0.5), 'F8': (0.6, 0.5),
-    'T7': (-0.7, 0), 'C3': (-0.3, 0), 'Cz': (0, 0), 'C4': (0.3, 0), 'T8': (0.7, 0),
-    'P7': (-0.6, -0.5), 'P3': (-0.3, -0.5), 'Pz': (0, -0.5), 'P4': (0.3, -0.5), 'P8': (0.6, -0.5),
-    'O1': (-0.3, -0.8), 'Oz': (0, -0.8), 'O2': (0.3, -0.8),
-    'AF3': (-0.2, 0.65), 'AF4': (0.2, 0.65),
-    'FC5': (-0.5, 0.25), 'FC1': (-0.15, 0.25), 'FC2': (0.15, 0.25), 'FC6': (0.5, 0.25),
-    'CP5': (-0.5, -0.25), 'CP1': (-0.15, -0.25), 'CP2': (0.15, -0.25), 'CP6': (0.5, -0.25),
-    'FT9': (-0.75, 0.15), 'FT10': (0.75, 0.15),
-    'PO9': (-0.5, -0.7), 'PO10': (0.5, -0.7)
+    'F7': (-0.6, 0.5), 'F3': (-0.3, 0.5), 'Fz': (0, 0.5),
+    'F4': (0.3, 0.5), 'F8': (0.6, 0.5),
+    'FT9': (-0.8, 0.2), 'FT10': (0.8, 0.2),
+    'FC5': (-0.5, 0.25), 'FC1': (-0.15, 0.25),
+    'FC2': (0.15, 0.25), 'FC6': (0.5, 0.25),
+    'T7': (-0.7, 0), 'C3': (-0.3, 0), 'Cz': (0, 0),
+    'C4': (0.3, 0), 'T8': (0.7, 0),
+    'CP5': (-0.5, -0.25), 'CP1': (-0.15, -0.25),
+    'CP2': (0.15, -0.25), 'CP6': (0.5, -0.25),
+    'P7': (-0.6, -0.5), 'P3': (-0.3, -0.5), 'Pz': (0, -0.5),
+    'P4': (0.3, -0.5), 'P8': (0.6, -0.5),
+    'PO9': (-0.45, -0.7), 'PO10': (0.45, -0.7),
+    'O1': (-0.3, -0.8), 'Oz': (0, -0.8), 'O2': (0.3, -0.8)
 }
 
 ROLLING_WINDOW_SIZE = 128
 CONTEXT_WINDOW = 5  # For SVM context stacking
+WINDOW_SIZE = 128
+STEP_SIZE = 64    
 
 # Dataset info (update these based on your actual data)
 DATASET_INFO = {
@@ -125,19 +135,33 @@ def load_cnn_model():
     try:
         # Try different possible paths
         possible_paths = [
-            os.path.join('models', 'eeg_emotion_cnn_model.h5'),
             os.path.join('models', 'eeg_emotion_cnn_model.keras'),
-            os.path.join('..', 'models', 'eeg_emotion_cnn_model.h5'),
             os.path.join('..', 'models', 'eeg_emotion_cnn_model.keras'),
         ]
         
         for path in possible_paths:
             if os.path.exists(path):
-                model = tf.keras.models.load_model(path)
+                model = tf.keras.models.load_model(
+                    path,
+                    custom_objects={"loss": focal_loss(alpha=[1.0,1.0,1.3,1.0], gamma=2.0)}
+                )
                 return model, {}
         return None, {}
     except Exception as e:
         return None, {}
+    
+def focal_loss(alpha=None, gamma=2.0):
+    def loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.int32)
+        y_true_onehot = tf.one_hot(y_true, depth=tf.shape(y_pred)[-1])
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        cross_entropy = -y_true_onehot * tf.math.log(y_pred)
+        weight = tf.pow(1 - y_pred, gamma)
+        if alpha is not None:
+            weight *= tf.constant(alpha, dtype=tf.float32)
+        return tf.reduce_sum(weight * cross_entropy, axis=-1)
+    return loss
+
 
 def create_context_windows(data, window_size=5):
     """Create context windows for SVM (sliding window stacking)"""
@@ -204,38 +228,26 @@ def preprocess_data(df):
 
 def preprocess_for_cnn(df):
     """Preprocess data for CNN (raw time series segments)"""
-    # Extract POW columns
-    pow_cols = [c for c in df.columns if str(c).strip().startswith("POW.")]
-    if not pow_cols:
-        return None
-    
-    # Get sensor columns
-    sensor_cols = []
-    for sensor in TARGET_SENSORS:
-        for col in pow_cols:
-            if f".{sensor}." in col:
-                sensor_cols.append(col)
-                break
-    
-    if not sensor_cols:
-        return None
-    
-    # Extract data and convert to numeric
-    data = df[sensor_cols].apply(pd.to_numeric, errors='coerce').dropna()
-    
-    # Reshape to (samples, time_steps, channels) for CNN
-    # Using sliding windows of size 128
-    window_size = 128
+    # 1. Select EEG channels in correct order
+    eeg_cols = []
+    for ch in TARGET_SENSORS:
+        col = f"EEG.{ch}"
+        if col not in df.columns:
+            raise ValueError(f"Missing channel: {col}")
+        eeg_cols.append(col)
+
+    eeg_data = df[eeg_cols].values  # (samples, 32)
+
+    # 2. Per-recording z-score normalization
+    eeg_data = (eeg_data - eeg_data.mean(axis=0)) / (eeg_data.std(axis=0) + 1e-6)
+
+    # 3. Sliding window segmentation
     segments = []
-    for i in range(0, len(data) - window_size + 1, window_size // 2):
-        segment = data.iloc[i:i+window_size].values
-        if len(segment) == window_size:
-            segments.append(segment)
-    
-    if not segments:
-        return None
-    
-    return np.array(segments)
+    for start in range(0, eeg_data.shape[0] - WINDOW_SIZE + 1, STEP_SIZE):
+        seg = eeg_data[start:start + WINDOW_SIZE]
+        segments.append(seg)
+
+    return np.array(segments, dtype=np.float32)
 
 def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_zscore=True, color_scale='plasma'):
     """Create a futuristic brain heatmap visualization with smooth interpolation.
