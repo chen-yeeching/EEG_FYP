@@ -462,7 +462,7 @@ def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_z
             scaleratio=1
         ),
         height=650,
-        width=650,
+        autosize=True,
         showlegend=False,
         plot_bgcolor='rgba(0,0,0,0)',  # Transparent background
         paper_bgcolor='rgba(0,0,0,0)',  # Transparent paper
@@ -1278,7 +1278,8 @@ def page_brain_heatmap():
                     color_scale='RdBu_r'
                 )
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
+
             else:
                 st.warning("Could not extract electrode data. Please check data format.")
         
