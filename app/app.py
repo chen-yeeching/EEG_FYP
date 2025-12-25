@@ -110,6 +110,18 @@ DATASET_INFO = {
     'class_distribution': {'Happy': 8, 'Neutral': 8, 'Sad': 8, 'Anxiety': 8}  # Update with actual
 }
 
+def focal_loss(alpha=None, gamma=2.0):
+    def loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.int32)
+        y_true_onehot = tf.one_hot(y_true, depth=tf.shape(y_pred)[-1])
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+        cross_entropy = -y_true_onehot * tf.math.log(y_pred)
+        weight = tf.pow(1 - y_pred, gamma)
+        if alpha is not None:
+            weight *= tf.constant(alpha, dtype=tf.float32)
+        return tf.reduce_sum(weight * cross_entropy, axis=-1)
+    return loss
+
 @st.cache_data
 def load_svm_model():
     """Load the trained SVM model"""
@@ -133,34 +145,43 @@ def load_cnn_model():
         return None, {}
     
     try:
+        # Get the directory where this script is located
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(script_dir)  # Go up from app/ to project root
+        
         # Try different possible paths
         possible_paths = [
-            os.path.join('models', 'eeg_emotion_cnn_model.keras'),
-            os.path.join('..', 'models', 'eeg_emotion_cnn_model.keras'),
+            os.path.join(project_root, 'models', 'eeg_emotion_cnn_model.keras'),  # From app/ -> ../models/
+            os.path.join('models', 'eeg_emotion_cnn_model.keras'),  # Relative to current working dir
+            os.path.join('..', 'models', 'eeg_emotion_cnn_model.keras'),  # Relative from app/
+            os.path.join(script_dir, '..', 'models', 'eeg_emotion_cnn_model.keras'),  # From app/ using script_dir
         ]
         
+        # Remove duplicates and normalize paths
+        possible_paths = [os.path.normpath(p) for p in possible_paths]
+        possible_paths = list(dict.fromkeys(possible_paths))  # Remove duplicates while preserving order
+        
+        last_error = None
         for path in possible_paths:
             if os.path.exists(path):
-                model = tf.keras.models.load_model(
-                    path,
-                    custom_objects={"loss": focal_loss(alpha=[1.0,1.0,1.3,1.0], gamma=2.0)}
-                )
-                return model, {}
+                try:
+                    model = tf.keras.models.load_model(
+                        path,
+                        custom_objects={"loss": focal_loss(alpha=[1.0,1.0,1.3,1.0], gamma=2.0)},
+                        compile=False  # Don't compile immediately, faster loading
+                    )
+                    # Verify model loaded correctly
+                    if model is not None:
+                        return model, {}
+                except Exception as load_error:
+                    # Store the error but try next path
+                    last_error = load_error
+                    continue
+        
+        # If we get here, model couldn't be loaded
         return None, {}
     except Exception as e:
         return None, {}
-    
-def focal_loss(alpha=None, gamma=2.0):
-    def loss(y_true, y_pred):
-        y_true = tf.cast(y_true, tf.int32)
-        y_true_onehot = tf.one_hot(y_true, depth=tf.shape(y_pred)[-1])
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-        cross_entropy = -y_true_onehot * tf.math.log(y_pred)
-        weight = tf.pow(1 - y_pred, gamma)
-        if alpha is not None:
-            weight *= tf.constant(alpha, dtype=tf.float32)
-        return tf.reduce_sum(weight * cross_entropy, axis=-1)
-    return loss
 
 
 def create_context_windows(data, window_size=5):
@@ -228,26 +249,49 @@ def preprocess_data(df):
 
 def preprocess_for_cnn(df):
     """Preprocess data for CNN (raw time series segments)"""
-    # 1. Select EEG channels in correct order
-    eeg_cols = []
-    for ch in TARGET_SENSORS:
-        col = f"EEG.{ch}"
-        if col not in df.columns:
-            raise ValueError(f"Missing channel: {col}")
-        eeg_cols.append(col)
+    try:
+        # 1. Select EEG channels in correct order matching TARGET_SENSORS
+        eeg_cols = []
+        for ch in TARGET_SENSORS:
+            col = f"EEG.{ch}"
+            if col in df.columns:
+                eeg_cols.append(col)
+            else:
+                # Try case-insensitive search or alternative naming
+                found = False
+                for df_col in df.columns:
+                    df_col_str = str(df_col).strip()
+                    if (df_col_str.upper() == col.upper() or 
+                        (ch in df_col_str and "EEG" in df_col_str.upper())):
+                        eeg_cols.append(df_col)
+                        found = True
+                        break
+                if not found:
+                    return None  # Required channel not found
+        
+        if len(eeg_cols) != len(TARGET_SENSORS):
+            return None  # Not all required channels found
 
-    eeg_data = df[eeg_cols].values  # (samples, 32)
+        eeg_data = df[eeg_cols].values  # (samples, num_channels)
+        
+        if eeg_data.shape[0] < WINDOW_SIZE:
+            return None  # Not enough samples
 
-    # 2. Per-recording z-score normalization
-    eeg_data = (eeg_data - eeg_data.mean(axis=0)) / (eeg_data.std(axis=0) + 1e-6)
+        # 2. Per-recording z-score normalization
+        eeg_data = (eeg_data - eeg_data.mean(axis=0)) / (eeg_data.std(axis=0) + 1e-6)
 
-    # 3. Sliding window segmentation
-    segments = []
-    for start in range(0, eeg_data.shape[0] - WINDOW_SIZE + 1, STEP_SIZE):
-        seg = eeg_data[start:start + WINDOW_SIZE]
-        segments.append(seg)
+        # 3. Sliding window segmentation
+        segments = []
+        for start in range(0, eeg_data.shape[0] - WINDOW_SIZE + 1, STEP_SIZE):
+            seg = eeg_data[start:start + WINDOW_SIZE]
+            segments.append(seg)
+        
+        if len(segments) == 0:
+            return None
 
-    return np.array(segments, dtype=np.float32)
+        return np.array(segments, dtype=np.float32)
+    except Exception:
+        return None
 
 def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_zscore=True, color_scale='plasma'):
     """Create a futuristic brain heatmap visualization with smooth interpolation.
@@ -552,7 +596,6 @@ def page_scientific_defense():
 def page_live_monitor():
     st.title("🫀 Live EEG Emotion Monitor")
     st.markdown("**Simulates a real-time data stream to demonstrate sequential analysis.**")
-    st.markdown("_This view runs **both** SVM (context window classifier) and CNN on the uploaded file._")
     
     # Load models
     svm_model, svm_scaler, svm_artifact = load_svm_model()
@@ -561,7 +604,33 @@ def page_live_monitor():
         st.error("SVM model not found. Please ensure 'models/eeg_emotion_svm_model.pkl' exists.")
         return
     
+    # Show model status (only show warnings/errors, not success messages)
+    if cnn_model is None:
+        if not TF_AVAILABLE:
+            st.warning("⚠️ CNN model: TensorFlow not installed. Install with `pip install tensorflow`")
+        else:
+            # Try to find the model file to give a better error message
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(script_dir)
+            model_path = os.path.join(project_root, 'models', 'eeg_emotion_cnn_model.keras')
+            if os.path.exists(model_path):
+                st.error(f"⚠️ CNN model: Model file exists but failed to load. Check console for errors.")
+            else:
+                st.warning(f"⚠️ CNN model: Model file not found. Expected at: {model_path}")
+    
     uploaded_file = st.file_uploader("Upload EEG CSV file", type=["csv"], key="live")
+    
+    # Clear previous simulation results when a new file is uploaded
+    if uploaded_file is not None:
+        # Check if this is a new file (different from what was processed)
+        current_file_name = uploaded_file.name
+        if 'last_processed_file' not in st.session_state or st.session_state['last_processed_file'] != current_file_name:
+            # Clear previous results
+            if 'svm_result' in st.session_state:
+                del st.session_state['svm_result']
+            if 'cnn_result' in st.session_state:
+                del st.session_state['cnn_result']
+            st.session_state['last_processed_file'] = current_file_name
     
     if uploaded_file is not None:
         try:
@@ -693,27 +762,56 @@ def page_live_monitor():
             y_pred_raw = svm_model.predict(X_scaled)
             y_pred_smooth = medfilt(y_pred_raw, kernel_size=5)
             
-            # Prepare CNN summary (overall prediction for this file)
-            cnn_summary_title = "🧠 CNN View"
+            # Prepare CNN predictions for real-time display
+            cnn_predictions_by_time = None
+            cnn_available = False
+            cnn_error_msg = None
+            
             if cnn_model is None:
-                cnn_summary_text = "CNN model not available. Please ensure the CNN model file exists, then use the **Comparative Analysis** tab (SVM vs CNN)."
+                if not TF_AVAILABLE:
+                    cnn_error_msg = "TensorFlow not available. Please install tensorflow."
+                else:
+                    cnn_error_msg = "CNN model file not found. Please ensure 'models/eeg_emotion_cnn_model.keras' exists."
             else:
-                cnn_data = preprocess_for_cnn(df)
-                if cnn_data is not None:
-                    try:
+                try:
+                    cnn_data = preprocess_for_cnn(df)
+                    if cnn_data is None:
+                        # Check what columns are available
+                        available_eeg_cols = [c for c in df.columns if 'EEG' in str(c).upper()]
+                        missing_channels = []
+                        for ch in TARGET_SENSORS:
+                            col = f"EEG.{ch}"
+                            if col not in df.columns:
+                                # Check case-insensitive
+                                found = any(str(c).upper() == col.upper() for c in df.columns)
+                                if not found:
+                                    missing_channels.append(ch)
+                        
+                        if len(missing_channels) > 0:
+                            cnn_error_msg = f"Missing EEG channels: {', '.join(missing_channels[:10])}{'...' if len(missing_channels) > 10 else ''}. Found {len(available_eeg_cols)} EEG columns."
+                        elif len(available_eeg_cols) == 0:
+                            cnn_error_msg = "No EEG columns found in data. CNN requires raw EEG data (EEG.Cz, EEG.Fz, etc.)."
+                        else:
+                            cnn_error_msg = f"Data preprocessing failed. Found {len(available_eeg_cols)} EEG columns but could not create segments."
+                    elif len(cnn_data) == 0:
+                        cnn_error_msg = "Not enough data samples for CNN (requires at least 128 samples)."
+                    else:
                         cnn_predictions = np.argmax(cnn_model.predict(cnn_data, verbose=0), axis=1)
                         cnn_smooth = medfilt(cnn_predictions, kernel_size=3)
                         
-                        unique_cnn, counts_cnn = np.unique(cnn_smooth, return_counts=True)
-                        most_common_idx_cnn = unique_cnn[np.argmax(counts_cnn)]
-                        cnn_emotion = EMOTION_LABELS[most_common_idx_cnn]
-                        cnn_confidence = (counts_cnn[np.argmax(counts_cnn)] / len(cnn_smooth)) * 100
+                        # Map CNN segment predictions to time steps
+                        # CNN uses sliding windows: segment i covers [i*STEP_SIZE, i*STEP_SIZE+WINDOW_SIZE-1]
+                        cnn_predictions_by_time = np.zeros(len(vis_data), dtype=int)
+                        for seg_idx in range(len(cnn_smooth)):
+                            start_time = seg_idx * STEP_SIZE
+                            end_time = min(start_time + WINDOW_SIZE, len(vis_data))
+                            # Assign this segment's prediction to all time steps it covers
+                            cnn_predictions_by_time[start_time:end_time] = cnn_smooth[seg_idx]
                         
-                        cnn_summary_text = f"**CNN Predicted Emotion:** {cnn_emotion} ({cnn_confidence:.1f}% confidence)"
-                    except Exception:
-                        cnn_summary_text = "CNN model encountered an error while processing this file. Please check the **Comparative Analysis** tab for more details."
-                else:
-                    cnn_summary_text = "Could not preprocess data for CNN on this file. Please verify the input format or use the **Comparative Analysis** tab."
+                        cnn_available = True
+                except Exception as e:
+                    cnn_error_msg = f"CNN processing error: {str(e)}"
+                    cnn_available = False
             
             # Ensure vis_data and predictions are aligned
             if len(vis_data) == 0:
@@ -722,18 +820,30 @@ def page_live_monitor():
             
             st.divider()
             
-            col_graph, col_status = st.columns([3, 1])
+            # Two separate simulation sections
+            st.subheader("🤖 SVM Simulation")
+            svm_col_graph, svm_col_status = st.columns([3, 1])
             
-            start_btn = st.button("▶ Start Live Simulation", type="primary")
+            svm_start_btn = st.button("▶ Start SVM Live Simulation", type="primary", key="svm_sim")
             
-            if start_btn:
-                chart_placeholder = col_graph.empty()
-                status_placeholder = col_status.empty()
-                progress_bar = st.progress(0)
+            # Display stored SVM results if they exist and simulation is not running
+            if 'svm_result' in st.session_state and st.session_state['svm_result'].get('chart') is not None and not svm_start_btn:
+                svm_col_graph.plotly_chart(st.session_state['svm_result']['chart'], use_container_width=True, key="svm_chart_final")
+                if st.session_state['svm_result'].get('status'):
+                    svm_col_status.markdown(st.session_state['svm_result']['status'], unsafe_allow_html=True)
+            
+            if svm_start_btn:
+                svm_chart_placeholder = svm_col_graph.empty()
+                svm_status_placeholder = svm_col_status.empty()
+                svm_progress_bar = st.progress(0)
                 
                 # Simulate streaming
                 step_size = max(1, len(vis_data) // 100)  # Show ~100 updates
                 total_steps = len(vis_data) // step_size
+                
+                # Store final chart and status for persistence
+                final_svm_fig = None
+                final_svm_status = None
                 
                 for step, i in enumerate(range(0, len(vis_data), step_size)):
                     # Update chart (show last 50 points)
@@ -741,24 +851,36 @@ def page_live_monitor():
                     if len(chart_data) > 0:
                         fig = go.Figure()
                         for col in chart_data.columns:
+                            # Create a better label: extract electrode and frequency band
+                            col_str = str(col)
+                            if '.' in col_str:
+                                parts = col_str.split('.')
+                                if len(parts) >= 3:
+                                    # Format: POW.Electrode.FrequencyBand -> "Electrode FrequencyBand"
+                                    label = f"{parts[1]} {parts[2]}"
+                                else:
+                                    label = parts[-1]
+                            else:
+                                label = col_str
                             fig.add_trace(go.Scatter(
                                 y=chart_data[col].values,
                                 mode='lines',
-                                name=col.split('.')[-1] if '.' in col else col
+                                name=label
                             ))
                         fig.update_layout(
-                            title=f"Live EEG Stream (Sample {i}/{len(vis_data)})",
+                            title=f"Live EEG Stream - SVM (Sample {i}/{len(vis_data)})",
                             xaxis_title="Time Step",
                             yaxis_title="Power",
                             height=400
                         )
-                        chart_placeholder.plotly_chart(fig, use_container_width=True)
+                        svm_chart_placeholder.plotly_chart(fig, use_container_width=True, key=f"svm_chart_live_{i}")
+                        final_svm_fig = fig  # Store final figure
                     
-                    # Update emotion status
+                    # Update emotion status - SVM only
                     pred_idx = min(i // step_size, len(y_pred_smooth) - 1)
                     if pred_idx >= 0:
                         current_emotion_idx = y_pred_smooth[pred_idx]
-                        emotion_name = EMOTION_LABELS.get(current_emotion_idx, "Unknown")
+                        svm_emotion_name = EMOTION_LABELS.get(current_emotion_idx, "Unknown")
                         
                         # Dynamic colors
                         color_map = {
@@ -767,24 +889,174 @@ def page_live_monitor():
                             "Sad": "🔵",
                             "Anxiety": "🔴"
                         }
-                        emoji = color_map.get(emotion_name, "⚪")
+                        svm_emoji = color_map.get(svm_emotion_name, "⚪")
                         
-                        status_placeholder.markdown(f"""
+                        status_html = f"""
                         ### Status:
-                        # {emoji} {emotion_name}
-                        
-                        **Confidence:** High  
-                        **Sequence Window:** {pred_idx}
-                        **Time Step:** {i}
-                        """)
+                        <h4>🤖 SVM:</h4>
+                        <h2>{svm_emoji} {svm_emotion_name}</h2>
+                        <hr style="margin: 1rem 0;">
+                        <p><small><strong>Time Step:</strong> {i}</small></p>
+                        <p><small><strong>Window:</strong> {pred_idx}</small></p>
+                        """
+                        svm_status_placeholder.markdown(status_html, unsafe_allow_html=True)
+                        final_svm_status = status_html  # Store final status
                     
-                    progress_bar.progress((step + 1) / total_steps)
+                    svm_progress_bar.progress((step + 1) / total_steps)
                     time.sleep(0.05)  # Controls playback speed
                 
-                progress_bar.empty()
-                st.success("✅ Simulation complete!")
-                st.subheader(cnn_summary_title)
-                st.markdown(cnn_summary_text)
+                svm_progress_bar.empty()
+                st.success("✅ SVM Simulation complete!")
+                
+                # Store SVM results for comparison and display
+                unique_svm, counts_svm = np.unique(y_pred_smooth, return_counts=True)
+                most_common_idx_svm = unique_svm[np.argmax(counts_svm)]
+                svm_emotion_final = EMOTION_LABELS[most_common_idx_svm]
+                svm_confidence_final = (counts_svm[np.argmax(counts_svm)] / len(y_pred_smooth)) * 100
+                st.session_state['svm_result'] = {
+                    'emotion': svm_emotion_final, 
+                    'confidence': svm_confidence_final,
+                    'chart': final_svm_fig,
+                    'status': final_svm_status
+                }
+            
+            st.divider()
+            
+            # CNN Simulation Section
+            st.subheader("🧠 CNN Simulation")
+            cnn_col_graph, cnn_col_status = st.columns([3, 1])
+            
+            cnn_start_btn = st.button("▶ Start CNN Live Simulation", type="primary", key="cnn_sim")
+            
+            # Display stored CNN results if they exist and simulation is not running
+            if 'cnn_result' in st.session_state and st.session_state['cnn_result'].get('chart') is not None and not cnn_start_btn:
+                cnn_col_graph.plotly_chart(st.session_state['cnn_result']['chart'], use_container_width=True, key="cnn_chart_final")
+                if st.session_state['cnn_result'].get('status'):
+                    cnn_col_status.markdown(st.session_state['cnn_result']['status'], unsafe_allow_html=True)
+            
+            if cnn_start_btn:
+                if not cnn_available:
+                    st.error(f"CNN is not available: {cnn_error_msg if cnn_error_msg else 'Unknown error'}")
+                else:
+                    cnn_chart_placeholder = cnn_col_graph.empty()
+                    cnn_status_placeholder = cnn_col_status.empty()
+                    cnn_progress_bar = st.progress(0)
+                    
+                    # Simulate streaming for CNN
+                    step_size = max(1, len(vis_data) // 100)  # Show ~100 updates
+                    total_steps = len(vis_data) // step_size
+                    
+                    # Store final chart and status for persistence
+                    final_cnn_fig = None
+                    final_cnn_status = None
+                    
+                    for step, i in enumerate(range(0, len(vis_data), step_size)):
+                        # Update chart (show last 50 points)
+                        chart_data = vis_data.iloc[max(0, i-50):i+1]
+                        if len(chart_data) > 0:
+                            fig = go.Figure()
+                            for col in chart_data.columns:
+                                # Create a better label: extract electrode and frequency band
+                                col_str = str(col)
+                                if '.' in col_str:
+                                    parts = col_str.split('.')
+                                    if len(parts) >= 3:
+                                        # Format: POW.Electrode.FrequencyBand -> "Electrode FrequencyBand"
+                                        label = f"{parts[1]} {parts[2]}"
+                                    else:
+                                        label = parts[-1]
+                                else:
+                                    label = col_str
+                                fig.add_trace(go.Scatter(
+                                    y=chart_data[col].values,
+                                    mode='lines',
+                                    name=label
+                                ))
+                            fig.update_layout(
+                                title=f"Live EEG Stream - CNN (Sample {i}/{len(vis_data)})",
+                                xaxis_title="Time Step",
+                                yaxis_title="Power",
+                                height=400
+                            )
+                            cnn_chart_placeholder.plotly_chart(fig, use_container_width=True, key=f"cnn_chart_live_{i}")
+                            final_cnn_fig = fig  # Store final figure
+                        
+                        # Update emotion status - CNN only
+                        if cnn_predictions_by_time is not None and i < len(cnn_predictions_by_time):
+                            cnn_emotion_idx = cnn_predictions_by_time[i]
+                            cnn_emotion_name = EMOTION_LABELS.get(cnn_emotion_idx, "Unknown")
+                            
+                            # Dynamic colors
+                            color_map = {
+                                "Happy": "🟢",
+                                "Neutral": "⚪",
+                                "Sad": "🔵",
+                                "Anxiety": "🔴"
+                            }
+                            cnn_emoji = color_map.get(cnn_emotion_name, "⚪")
+                            
+                            # Calculate segment index for CNN
+                            # CNN uses sliding windows, so segment index is based on time step
+                            cnn_seg_idx = i // STEP_SIZE
+                            
+                            status_html = f"""
+                            ### Status:
+                            <h4>🧠 CNN:</h4>
+                            <h2>{cnn_emoji} {cnn_emotion_name}</h2>
+                            <hr style="margin: 1rem 0;">
+                            <p><small><strong>Time Step:</strong> {i}</small></p>
+                            <p><small><strong>Segment:</strong> {cnn_seg_idx}</small></p>
+                            """
+                            cnn_status_placeholder.markdown(status_html, unsafe_allow_html=True)
+                            final_cnn_status = status_html  # Store final status
+                        
+                        cnn_progress_bar.progress((step + 1) / total_steps)
+                        time.sleep(0.05)  # Controls playback speed
+                    
+                    cnn_progress_bar.empty()
+                    st.success("✅ CNN Simulation complete!")
+                    
+                    # Store CNN results for comparison and display
+                    unique_cnn, counts_cnn = np.unique(cnn_predictions_by_time, return_counts=True)
+                    most_common_idx_cnn = unique_cnn[np.argmax(counts_cnn)]
+                    cnn_emotion_final = EMOTION_LABELS[most_common_idx_cnn]
+                    cnn_confidence_final = (counts_cnn[np.argmax(counts_cnn)] / len(cnn_predictions_by_time)) * 100
+                    st.session_state['cnn_result'] = {
+                        'emotion': cnn_emotion_final, 
+                        'confidence': cnn_confidence_final,
+                        'chart': final_cnn_fig,
+                        'status': final_cnn_status
+                    }
+            
+            
+            # Show comparison if both simulations have been run
+            if 'svm_result' in st.session_state and 'cnn_result' in st.session_state:
+                st.divider()
+                st.subheader("📊 Comparison: SVM vs CNN")
+                col1, col2 = st.columns(2)
+                with col1:
+                    svm_res = st.session_state['svm_result']
+                    st.markdown(f"""
+                    <div class="status-box" style="border-color: {EMOTION_COLORS[svm_res['emotion']]};">
+                        <h3>🤖 SVM</h3>
+                        <h2>{svm_res['emotion']}</h2>
+                        <p>Confidence: {svm_res['confidence']:.1f}%</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with col2:
+                    cnn_res = st.session_state['cnn_result']
+                    st.markdown(f"""
+                    <div class="status-box" style="border-color: {EMOTION_COLORS[cnn_res['emotion']]};">
+                        <h3>🧠 CNN</h3>
+                        <h2>{cnn_res['emotion']}</h2>
+                        <p>Confidence: {cnn_res['confidence']:.1f}%</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                if svm_res['emotion'] == cnn_res['emotion']:
+                    st.success(f"✅ Both models agree: **{svm_res['emotion']}**")
+                else:
+                    st.warning(f"⚠️ Models disagree: SVM predicts **{svm_res['emotion']}**, CNN predicts **{cnn_res['emotion']}**")
                 
         except Exception as e:
             st.error(f"Error processing file: {e}")
