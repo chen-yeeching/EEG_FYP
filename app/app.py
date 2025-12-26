@@ -140,7 +140,7 @@ def load_svm_model():
 
 @st.cache_data
 def load_cnn_model():
-    """Load the trained CNN model"""
+    """Load the trained CNN model (if available)"""
     if not TF_AVAILABLE:
         return None, {}
     
@@ -293,7 +293,7 @@ def preprocess_for_cnn(df):
     except Exception:
         return None
 
-def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_zscore=True, color_scale='plasma'):
+def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_zscore=True, color_scale='plasma', use_alpha=True):
     """Create a futuristic brain heatmap visualization with smooth interpolation.
     
     Features:
@@ -302,6 +302,7 @@ def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_z
     - Futuristic colormap (plasma)
     - Contour lines for depth
     - Horizontal colorbar at bottom
+    - Uses Alpha frequency band data for visualization
     """
     fig = go.Figure()
     
@@ -339,7 +340,8 @@ def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_z
         colorbar_title = "Activity Level"
     
     # Create a fine grid for smooth interpolation
-    grid_resolution = 100
+    # Further reduced resolution for faster, smoother rendering during live updates
+    grid_resolution = 60  # Reduced from 100 to 60 for much faster rendering
     x_grid = np.linspace(-1.1, 1.1, grid_resolution)
     y_grid = np.linspace(-1.1, 1.1, grid_resolution)
     X_grid, Y_grid = np.meshgrid(x_grid, y_grid)
@@ -471,90 +473,6 @@ def create_brain_heatmap(electrode_values, title="Brain Activity Heatmap", use_z
     
     return fig
 
-def create_brain_heatmap_animation(
-    frames_data,
-    title="Brain Activity Over Time",
-    use_zscore=True,
-    color_scale='RdBu_r'
-):
-    # ---- Prepare electrode positions ----
-    electrodes = list(ELECTRODE_POSITIONS.keys())
-    x_pos = [ELECTRODE_POSITIONS[e][0] for e in electrodes]
-    y_pos = [ELECTRODE_POSITIONS[e][1] for e in electrodes]
-
-    # ---- Helper to compute z-scored values ----
-    def normalize(values):
-        values = np.array(values, dtype=float)
-        if use_zscore and len(values) > 1:
-            mean = values.mean()
-            std = values.std() or 1e-6
-            z = (values - mean) / std
-            max_abs = np.max(np.abs(z))
-            return z, -max_abs, max_abs
-        return values, values.min(), values.max()
-
-    # ---- First frame ----
-    first_vals = [frames_data[0].get(e, 0) for e in electrodes]
-    z_vals, cmin, cmax = normalize(first_vals)
-
-    fig = go.Figure(
-        data=[
-            go.Scatter(
-                x=x_pos,
-                y=y_pos,
-                mode="markers",
-                marker=dict(
-                    size=14,
-                    color=z_vals,
-                    colorscale=color_scale,
-                    cmin=cmin,
-                    cmax=cmax,
-                    line=dict(width=2, color="white"),
-                    colorbar=dict(title="Z-score")
-                ),
-                text=electrodes,
-                hovertemplate="%{text}<br>Z: %{marker.color:.2f}<extra></extra>"
-            )
-        ],
-        layout=go.Layout(
-            title=title,
-            xaxis=dict(visible=False),
-            yaxis=dict(visible=False, scaleanchor="x"),
-            plot_bgcolor="rgba(0,0,0,0)",
-            paper_bgcolor="rgba(0,0,0,0)",
-            updatemenus=[{
-                "type": "buttons",
-                "buttons": [
-                    {
-                        "label": "▶ Play",
-                        "method": "animate",
-                        "args": [None, {"frame": {"duration": 120}, "fromcurrent": True}]
-                    },
-                    {
-                        "label": "⏸ Pause",
-                        "method": "animate",
-                        "args": [[None], {"frame": {"duration": 0}}]
-                    }
-                ]
-            }]
-        ),
-        frames=[
-            go.Frame(
-                data=[
-                    go.Scatter(
-                        marker=dict(
-                            color=normalize([frame.get(e, 0) for e in electrodes])[0]
-                        )
-                    )
-                ],
-                name=str(i)
-            )
-            for i, frame in enumerate(frames_data)
-        ]
-    )
-
-    return fig
-
 def extract_electrode_data(df, frequency_band='Alpha', metric='mean'):
     """Extract electrode values for a specific frequency band.
     Extracts all available electrodes that have positions defined.
@@ -600,26 +518,48 @@ def extract_electrode_data(df, frequency_band='Alpha', metric='mean'):
     
     return electrode_values
 
-def generate_electrode_frames(
-    df,
-    frequency_band="Alpha",
-    metric="mean",
-    window_size=50,
-    step_size=10
-):
+def extract_electrode_data_from_row(row, frequency_band='Alpha'):
+    """Extract electrode values from a single row (for live heatmap).
+    Returns electrode values directly from the row without averaging.
     """
-    Split EEG data into overlapping windows and extract electrode values per window.
-    Returns a list of electrode_value dictionaries (one per frame).
-    """
-    frames = []
-
-    for start in range(0, len(df) - window_size, step_size):
-        df_window = df.iloc[start:start + window_size]
-        values = extract_electrode_data(df_window, frequency_band, metric)
-        if values:
-            frames.append(values)
-
-    return frames
+    electrode_values = {}
+    
+    # Find all available electrodes from the data
+    pow_cols = [c for c in row.index if str(c).strip().startswith("POW.")]
+    
+    # Extract electrode names from column names
+    available_electrodes = set()
+    for col in pow_cols:
+        parts = str(col).split('.')
+        if len(parts) >= 3 and frequency_band in parts[-1]:
+            # Extract electrode name (e.g., "POW.Fp1.Alpha" -> "Fp1")
+            electrode = parts[1]
+            if electrode in ELECTRODE_POSITIONS:
+                available_electrodes.add(electrode)
+    
+    # Extract values for all available electrodes from this row
+    for sensor in available_electrodes:
+        col_name = f"POW.{sensor}.{frequency_band}"
+        value = None
+        if col_name in row.index:
+            try:
+                value = float(row[col_name])
+            except (ValueError, TypeError):
+                continue
+        else:
+            # Try alternative column names
+            for col in pow_cols:
+                if sensor in str(col) and frequency_band in str(col):
+                    try:
+                        value = float(row[col])
+                        break
+                    except (ValueError, TypeError):
+                        continue
+        
+        if value is not None and not np.isnan(value):
+            electrode_values[sensor] = value
+    
+    return electrode_values
 
 # ============================================
 # PAGE 1: Data Overview
@@ -901,9 +841,8 @@ def page_live_monitor():
                     elif len(cnn_data) == 0:
                         cnn_error_msg = "Not enough data samples for CNN (requires at least 128 samples)."
                     else:
-                        cnn_probs = cnn_model.predict(cnn_data, verbose=0)   # (n_segments, 4)
-                        cnn_predictions = np.argmax(cnn_probs, axis=1)
-                        cnn_smooth = medfilt(cnn_predictions, kernel_size=5)
+                        cnn_predictions = np.argmax(cnn_model.predict(cnn_data, verbose=0), axis=1)
+                        cnn_smooth = medfilt(cnn_predictions, kernel_size=3)
                         
                         # Map CNN segment predictions to time steps
                         # CNN uses sliding windows: segment i covers [i*STEP_SIZE, i*STEP_SIZE+WINDOW_SIZE-1]
@@ -1016,20 +955,12 @@ def page_live_monitor():
                 
                 # Store SVM results for comparison and display
                 unique_svm, counts_svm = np.unique(y_pred_smooth, return_counts=True)
-                sorted_idx = np.argsort(counts_svm)[::-1]
-                top2_svm = []
-                total = np.sum(counts_svm)
-
-                for idx in sorted_idx[:2]:
-                    emotion = EMOTION_LABELS[unique_svm[idx]]
-                    confidence = (counts_svm[idx] / total) * 100
-                    top2_svm.append((emotion, confidence))
-                svm_emotion_final = top2_svm[0][0]
-                svm_confidence_final = top2_svm[0][1]
+                most_common_idx_svm = unique_svm[np.argmax(counts_svm)]
+                svm_emotion_final = EMOTION_LABELS[most_common_idx_svm]
+                svm_confidence_final = (counts_svm[np.argmax(counts_svm)] / len(y_pred_smooth)) * 100
                 st.session_state['svm_result'] = {
                     'emotion': svm_emotion_final, 
                     'confidence': svm_confidence_final,
-                    'top2': top2_svm,
                     'chart': final_svm_fig,
                     'status': final_svm_status
                 }
@@ -1131,23 +1062,13 @@ def page_live_monitor():
                     st.success("✅ CNN Simulation complete!")
                     
                     # Store CNN results for comparison and display
-                    unique_cnn, counts_cnn = np.unique(cnn_smooth, return_counts=True)
-                    sorted_idx = np.argsort(counts_cnn)[::-1]
-                    total = np.sum(counts_cnn)
-
-                    top2_cnn = []
-                    for idx in sorted_idx[:2]:
-                        emotion = EMOTION_LABELS[unique_cnn[idx]]
-                        confidence = (counts_cnn[idx] / total) * 100
-                        top2_cnn.append((emotion, confidence))
-
-                    cnn_emotion_final = top2_cnn[0][0]
-                    cnn_confidence_final = top2_cnn[0][1]
-                    
+                    unique_cnn, counts_cnn = np.unique(cnn_predictions_by_time, return_counts=True)
+                    most_common_idx_cnn = unique_cnn[np.argmax(counts_cnn)]
+                    cnn_emotion_final = EMOTION_LABELS[most_common_idx_cnn]
+                    cnn_confidence_final = (counts_cnn[np.argmax(counts_cnn)] / len(cnn_predictions_by_time)) * 100
                     st.session_state['cnn_result'] = {
                         'emotion': cnn_emotion_final, 
                         'confidence': cnn_confidence_final,
-                        'top2': top2_cnn,
                         'chart': final_cnn_fig,
                         'status': final_cnn_status
                     }
@@ -1160,32 +1081,20 @@ def page_live_monitor():
                 col1, col2 = st.columns(2)
                 with col1:
                     svm_res = st.session_state['svm_result']
-                    svm_top2_text = "<br>".join(
-                        [f"{emo}: {conf:.1f}%" for emo, conf in svm_res['top2']]
-                    )
                     st.markdown(f"""
                     <div class="status-box" style="border-color: {EMOTION_COLORS[svm_res['emotion']]};">
                         <h3>🤖 SVM</h3>
                         <h2>{svm_res['emotion']}</h2>
                         <p>Confidence: {svm_res['confidence']:.1f}%</p>
-                        <hr>
-                        <p>Top-2 Emotions</strong><br>{svm_top2_text}</p>
                     </div>
                     """, unsafe_allow_html=True)
                 with col2:
                     cnn_res = st.session_state['cnn_result']
-                    cnn_top2_text = ""
-                    if 'top2' in cnn_res:
-                        cnn_top2_text = "<br>".join(
-                            [f"{emo}: {conf:.1f}%" for emo, conf in cnn_res['top2']]
-                        )
                     st.markdown(f"""
                     <div class="status-box" style="border-color: {EMOTION_COLORS[cnn_res['emotion']]};">
                         <h3>🧠 CNN</h3>
                         <h2>{cnn_res['emotion']}</h2>
                         <p>Confidence: {cnn_res['confidence']:.1f}%</p>
-                        <hr>
-                        <p>Top-2 Emotions</strong><br>{cnn_top2_text}</p>
                     </div>
                     """, unsafe_allow_html=True)
                 
@@ -1395,28 +1304,103 @@ def page_brain_heatmap():
                     uploaded_file.seek(0)
                     df = pd.read_csv(uploaded_file, header=0, low_memory=False)
             
-            # Use default settings: Alpha band, mean metric, all data
-            frequency_band = "Alpha"
-            metric = "mean"
+            # Convert numeric columns
+            pow_cols = [c for c in df.columns if str(c).strip().startswith("POW.")]
+            if pow_cols:
+                df[pow_cols] = df[pow_cols].apply(pd.to_numeric, errors='coerce')
             
-            # Extract electrode data
-            frames_data = generate_electrode_frames(
-                df,
-                frequency_band=frequency_band,
-                metric=metric,
-                window_size=50,
-                step_size=10
-            )
-
-            if frames_data:
-                fig = create_brain_heatmap_animation(
-                    frames_data,
-                    title="Simulated Real-Time Neural Topography",
-                    color_scale="RdBu_r"
-                )
-                st.plotly_chart(fig, use_container_width=True)
+            # Filter out rows with all NaN in Alpha columns
+            alpha_cols = [c for c in pow_cols if '.Alpha' in str(c)]
+            if alpha_cols:
+                df = df.dropna(subset=alpha_cols, how='all')
+            
+            if len(df) == 0:
+                st.error("No valid data found. Please check your CSV file.")
+                return
+            
+            # Check if we have Alpha band data
+            if not alpha_cols:
+                st.error("No Alpha band data found in the CSV file.")
+                return
+            
+            # Start Live Heatmap button
+            start_btn = st.button("▶ Start Live Heatmap", type="primary", key="start_live_heatmap")
+            
+            if start_btn:
+                # Create placeholder for heatmap
+                heatmap_placeholder = st.empty()
+                progress_bar = st.progress(0)
+                
+                # Maximum optimization for smooth, continuous animation
+                # Use very few frames with long delays to prevent any blinking
+                target_frames = 20  # Fixed at 20 frames for maximum smoothness
+                step_size = max(1, len(df) // target_frames)
+                total_steps = min(target_frames, len(df) // step_size)
+                
+                for step, idx in enumerate(range(0, len(df), step_size)):
+                    if step >= total_steps:
+                        break
+                        
+                    # Extract electrode data from current row
+                    current_row = df.iloc[idx]
+                    electrode_values = extract_electrode_data_from_row(current_row, frequency_band='Alpha')
+                    
+                    if electrode_values:
+                        # Create heatmap for current time step
+                        futuristic_title = f"Live Neural Topography - Time Step {idx}/{len(df)}"
+                        
+                        fig = create_brain_heatmap(
+                            electrode_values, 
+                            title=futuristic_title,
+                            use_zscore=True,
+                            color_scale='RdBu_r',
+                            use_alpha=True
+                        )
+                        
+                        if fig:
+                            # Use unique key for each frame (required by Streamlit)
+                            # Disable all interactive features for maximum smoothness
+                            heatmap_placeholder.plotly_chart(
+                                fig, 
+                                use_container_width=True, 
+                                config={
+                                    "responsive": True,
+                                    "displayModeBar": False,  # Hide toolbar
+                                    "staticPlot": False,
+                                    "doubleClick": "reset",
+                                    "showTips": False,
+                                    "scrollZoom": False
+                                },
+                                key=f"heatmap_live_{idx}"  # Unique key for each frame
+                            )
+                    
+                    # Update progress every frame
+                    progress_bar.progress((step + 1) / total_steps)
+                    
+                    # Long delay for very smooth, continuous animation without any blinking
+                    time.sleep(0.3)  # 300ms delay for maximum smoothness
+                
+                progress_bar.empty()
+                st.success("✅ Live heatmap visualization complete!")
+            
             else:
-                st.warning("Not enough data to generate animation.")
+                # Show static preview using first row
+                if len(df) > 0:
+                    preview_row = df.iloc[0]
+                    electrode_values = extract_electrode_data_from_row(preview_row, frequency_band='Alpha')
+                    
+                    if electrode_values:
+                        fig = create_brain_heatmap(
+                            electrode_values, 
+                            title="Brain Activity Heatmap (Preview - Click 'Start Live Heatmap' to animate)",
+                            use_zscore=True,
+                            color_scale='RdBu_r',
+                            use_alpha=True
+                        )
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True, config={"responsive": True})
+                    else:
+                        st.warning("Could not extract electrode data. Please check data format.")
         
         except Exception as e:
             st.error(f"Error processing file: {e}")
