@@ -841,7 +841,29 @@ def page_live_monitor():
                     elif len(cnn_data) == 0:
                         cnn_error_msg = "Not enough data samples for CNN (requires at least 128 samples)."
                     else:
-                        cnn_predictions = np.argmax(cnn_model.predict(cnn_data, verbose=0), axis=1)
+                        cnn_probs = cnn_model.predict(cnn_data, verbose=0)
+                        cnn_predictions = np.argmax(cnn_probs, axis=1)
+
+                        # Reject low-confidence windows
+                        CONF_THRESH = 0.5
+                        conf = np.max(cnn_probs, axis=1)
+                        valid_idx = conf >= CONF_THRESH
+
+                        filtered_preds = cnn_predictions[valid_idx]
+                        filtered_probs = cnn_probs[valid_idx]
+
+                        # Safety fallback
+                        if len(filtered_preds) == 0:
+                            filtered_preds = cnn_predictions
+                            filtered_probs = cnn_probs
+
+                        # Confidence-weighted voting (FILE-LEVEL decision)
+                        weights = np.max(filtered_probs, axis=1)
+                        weighted_votes = np.bincount(filtered_preds, weights=weights)
+                        final_cnn_idx = np.argmax(weighted_votes)
+                        final_cnn_emotion = EMOTION_LABELS[final_cnn_idx]
+
+                        # Keep smoothing ONLY for visualization
                         cnn_smooth = medfilt(cnn_predictions, kernel_size=3)
                         
                         # Map CNN segment predictions to time steps
@@ -868,6 +890,7 @@ def page_live_monitor():
             # Two separate simulation sections
             st.subheader("🤖 SVM Simulation")
             svm_col_graph, svm_col_status = st.columns([3, 1])
+            st.caption("🔹 Live emotion reflects the current EEG window; final decision is obtained via majority voting shown in the comparison section below.")
             
             svm_start_btn = st.button("▶ Start SVM Live Simulation", type="primary", key="svm_sim")
             
@@ -970,6 +993,7 @@ def page_live_monitor():
             # CNN Simulation Section
             st.subheader("🧠 CNN Simulation")
             cnn_col_graph, cnn_col_status = st.columns([3, 1])
+            st.caption("🔹 Live emotion reflects the current EEG segment; final decision is obtained via confidence-weighted voting shown in the comparison section below.")
             
             cnn_start_btn = st.button("▶ Start CNN Live Simulation", type="primary", key="cnn_sim")
             
@@ -1042,7 +1066,8 @@ def page_live_monitor():
                             
                             # Calculate segment index for CNN
                             # CNN uses sliding windows, so segment index is based on time step
-                            cnn_seg_idx = i // STEP_SIZE
+                            raw_time_idx = min(i, len(cnn_predictions_by_time) - 1)
+                            cnn_seg_idx = raw_time_idx // STEP_SIZE
                             
                             status_html = f"""
                             ### Status:
@@ -1062,10 +1087,9 @@ def page_live_monitor():
                     st.success("✅ CNN Simulation complete!")
                     
                     # Store CNN results for comparison and display
-                    unique_cnn, counts_cnn = np.unique(cnn_predictions_by_time, return_counts=True)
-                    most_common_idx_cnn = unique_cnn[np.argmax(counts_cnn)]
-                    cnn_emotion_final = EMOTION_LABELS[most_common_idx_cnn]
-                    cnn_confidence_final = (counts_cnn[np.argmax(counts_cnn)] / len(cnn_predictions_by_time)) * 100
+                    cnn_emotion_final = final_cnn_emotion
+                    cnn_confidence_final = (np.max(weighted_votes) / np.sum(weighted_votes)) * 100
+
                     st.session_state['cnn_result'] = {
                         'emotion': cnn_emotion_final, 
                         'confidence': cnn_confidence_final,
