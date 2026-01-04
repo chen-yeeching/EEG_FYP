@@ -231,11 +231,3 @@ Model training notebooks are available in the `notebooks/` directory:
 - `EEG_SVM_Emotion_Recognition.ipynb`: SVM model training
 
 These notebooks were originally developed in Google Colab and can be adapted for local execution.
-
-## License
-
-[Add your license information here]
-
-## Author
-
-[Add your information here]
